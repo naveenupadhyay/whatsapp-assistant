@@ -63,7 +63,6 @@ def get_user_intent(user_query: str):
 
 
 def create_collection():
-    # TODO in the real environment need to change to create_collection()
     db.recreate_collection(
         collection_name=const.collection_name,
         vectors_config=models.VectorParams(
@@ -132,7 +131,6 @@ def float_vector(vector: List[float]):
     return list(map(float, vector))
 
 
-# TODO can be improved if embedding is done parallely because it is independent
 def get_points(qa_list: List[Dict[str, str]]):
     points = [
         models.PointStruct(
