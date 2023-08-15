@@ -1,108 +1,161 @@
 import os
-import json
 import openai
 import requests as network
 import constants as const
+import cohere
+import uuid
 from fastapi import FastAPI, Request, BackgroundTasks
 from twilio.rest import Client
 from langchain.prompts import PromptTemplate, FewShotPromptTemplate
-from langchain.embeddings import OpenAIEmbeddings
 from langchain.document_loaders import PyPDFLoader
 from langchain.chat_models import ChatOpenAI
 from langchain.llms import OpenAI
 from langchain.schema import SystemMessage, HumanMessage
-from langchain.vectorstores import DeepLake
+from qdrant_client import QdrantClient, models
 from langchain.document_transformers import DoctranQATransformer
 from langchain.chains import LLMChain
-from langchain.prompts.example_selector import SemanticSimilarityExampleSelector
+from typing import List, Dict
 from langchain.callbacks import get_openai_callback
 from dotenv import load_dotenv
 
 app = FastAPI()
 load_dotenv()
-sid = os.getenv('TWILIO_SID')
-token = os.getenv('TWILIO_TOKEN')
-apiKey = os.getenv('OPENAI_API_KEY')
-alToken = os.getenv('ACTIVELOOP_TOKEN')
-dataset_name = "medical_doc_ds"
-dataset_path = f"data/{dataset_name}"
+sid = os.getenv("SID")
+token = os.getenv("TOKEN")
+apiKey = os.getenv("OPENAI_API_KEY")
+cohereApiKey = os.getenv("COHERE_API_KEY")
 
 # load the essential models
 
 client = Client(sid, token)
 chat_model = ChatOpenAI(openai_api_key=apiKey, model_name="gpt-4")
-intent_model = OpenAI(openai_api_key=apiKey, model_name="gpt-4")
+intent_model = cohere.Client(cohereApiKey)
+embedding_model = cohere.Client(cohereApiKey)
 qa_model = OpenAI(openai_api_key=apiKey, model_name="gpt-4")
+qa_transformer = DoctranQATransformer(
+    openai_api_key=apiKey, openai_api_model="gpt-3.5-turbo-16k"
+)
+# initialize the vector db
+db = QdrantClient(path="app/data/kb")
 
 # load the chains
-intent_chain: LLMChain
 qa_chain: LLMChain
-# load the vector db
-db: DeepLake
-# load the embeddings
-embeddings: OpenAIEmbeddings
 
 
 def write_log(message: str):
-    if os.path.exists("logs/log.txt"):
-        with open("logs/log.txt", "a") as f:
+    if os.path.exists("app/logs/log.txt"):
+        with open("app/logs/log.txt", "a") as f:
             f.write(message + "\n")
     else:
-        with open("logs/log.txt", "w") as f:
+        with open("app/logs/log.txt", "w") as f:
             f.write(message + "\n")
 
 
-def load_intent_chain():
-    global intent_chain
-    intent_prompt_template = PromptTemplate(
-        input_variables=["query"], template=const.DETECT_INTENT_PROMPT
+def embed_query(query: str):
+    return embedding_model.embed(texts=[query]).embeddings[0]
+
+
+def get_user_intent(user_query: str):
+    response = intent_model.classify(
+        inputs=[user_query], examples=const.examples, model="large"
     )
-    intent_chain = LLMChain(llm=intent_model, prompt=intent_prompt_template)
+    return response.classifications[0].prediction
 
 
-def load_qa_chain():
+def create_collection():
+    # TODO in the real environment need to change to create_collection()
+    db.recreate_collection(
+        collection_name=const.collection_name,
+        vectors_config=models.VectorParams(
+            size=const.COHERE_SIZE_VECTOR, distance=models.Distance.COSINE
+        ),
+    )
+
+
+def get_generated_image(user_prompt: str):
+    response = openai.Image.create(
+        api_key=apiKey, prompt=user_prompt, n=1, size=const.image_size
+    )
+    image_url = response["data"][0]["url"]
+    return image_url
+
+
+def load_qa_chain(example_list: List[Dict[str, str]]):
     global qa_chain
-    with open("data/converted_json.txt", "r") as f:
-        content = json.load(f)
-
-    example_list = content["questions_and_answers"]
 
     example_prompt = PromptTemplate(
         input_variables=["question", "answer"], template=const.example_template
     )
 
-    example_selector = SemanticSimilarityExampleSelector.from_examples(
-        example_list, embeddings, db, k=3
-    )
-
     few_shot_prompt = FewShotPromptTemplate(
-        example_selector=example_selector,
+        examples=example_list,
         example_prompt=example_prompt,
         prefix=const.prefix,
         suffix=const.suffix,
         input_variables=["user_query"],
         example_separator="\n",
     )
+
     qa_chain = LLMChain(llm=qa_model, prompt=few_shot_prompt)
+
+
+async def ingest_uploaded_pdf(
+    msg_from: str, msg_to: str, url: str, worker: BackgroundTasks
+):
+    write_log(f"Starting to ingest the pdf")
+    info = network.head(url=url)
+    # get the expected size in mb
+    expected_size = int(info.headers["Content-Length"]) / 1000000
+    write_log(f"The size of the uploaded pdf {expected_size}")
+    if expected_size > 2:
+        client.messages.create(
+            to=msg_from, from_=msg_to, body=const.size_greater_than_2
+        )
+    else:
+        pdf_data = network.get(url)
+        # write the uploaded pdf to the local storage in data folder
+        with open("app/data/uploaded.pdf", "wb") as f:
+            f.write(pdf_data.content)
+        loader = PyPDFLoader(file_path="app/data/uploaded.pdf")
+        documents = loader.load()
+        transformed_docs = await qa_transformer.atransform_documents(documents)
+        for doc in transformed_docs:
+            qa_list = doc.metadata["questions_and_answers"]
+            points = get_points(qa_list)
+            db.upsert(collection_name=const.collection_name, points=points)
+        worker.add_task(remove_uploaded_file, "app/data/uploaded.pdf")
+        client.messages.create(to=msg_from, from_=msg_to,
+                               body=const.pdf_ready_for_qa)
+
+
+def float_vector(vector: List[float]):
+    return list(map(float, vector))
+
+
+# TODO can be improved if embedding is done parallely because it is independent
+def get_points(qa_list: List[Dict[str, str]]):
+    points = [
+        models.PointStruct(
+            id=uuid.uuid4().hex,
+            payload={"question": point["question"], "answer": point["answer"]},
+            vector=float_vector(embed_query(point["question"])),
+        )
+        for point in qa_list
+    ]
+    return points
 
 
 @app.on_event("startup")
 async def load_doc_pipeline():
-    global db
-    global embeddings
-    db = DeepLake(token=alToken, dataset_path=dataset_path)
-    embeddings = OpenAIEmbeddings(openai_api_key=apiKey, model="text-embedding-ada-002")
-    loader = PyPDFLoader("data/medical_insurance.pdf")
+    create_collection()
+    loader = PyPDFLoader("app/data/medical_insurance.pdf")
     docs = loader.load()
-    qa_transformer = DoctranQATransformer(
-        openai_api_key=apiKey, openai_api_model="gpt-3.5-turbo-16k"
-    )
     transformed_document = await qa_transformer.atransform_documents(docs)
     qa_meta = transformed_document[0].metadata
-    with open("data/converted_json.txt", "w") as file:
-        file.write(json.dumps(qa_meta))
-    load_intent_chain()
-    load_qa_chain()
+    qa_list = qa_meta["questions_and_answers"]
+    points = get_points(qa_list)
+    # update or insert data into the database
+    db.upsert(collection_name=const.collection_name, points=points)
 
 
 @app.on_event("shutdown")
@@ -112,22 +165,30 @@ async def unload_pipeline():
 
 async def get_transcript(recording_url: str):
     audio_result = network.get(recording_url)
-    open("user_query.mp3", "wb").write(audio_result.content)
-    audio_file = open("user_query.mp3", "rb")
+    open("app/data/user_query.mp3", "wb").write(audio_result.content)
+    audio_file = open("app/data/user_query.mp3", "rb")
     with get_openai_callback() as cb:
-        transcription = openai.Audio.transcribe("whisper-1", audio_file, api_key=apiKey)
+        transcription = openai.Audio.transcribe(
+            "whisper-1", audio_file, api_key=apiKey)
         print(f"The cost for transcription is {cb.total_cost}")
     user_query = transcription["text"]
     return user_query
 
 
-def remove_audio_file():
-    if os.path.exists("user_query.mp3"):
-        os.remove("user_query.mp3")
+def remove_uploaded_file(file_path: str):
+    if os.path.exists(file_path):
+        os.remove(file_path)
 
 
 def run_insurance_query(msg_from: str, msg_to: str, user_query: str):
-    print("Running insurance query")
+    print("Running db query")
+    hits = db.search(
+        collection_name=const.collection_name,
+        query_vector=embed_query(user_query),
+        limit=3,
+    )
+    examples = [hit.payload for hit in hits]
+    load_qa_chain(example_list=examples)
     with get_openai_callback() as cb:
         response = qa_chain.run({"user_query": user_query})
         print(f"Cost for insurance query {cb.total_cost}")
@@ -146,7 +207,7 @@ def run_normal_query(msg_from: str, msg_to: str, user_query: str):
         result = chat_model(messages)
         print(f"The cost for chat is {cb.total_cost}")
     content = result.content
-    chunks = [content[i : i + 1500] for i in range(0, len(content), 1500)]
+    chunks = [content[i: i + 1500] for i in range(0, len(content), 1500)]
     for content_body in chunks:
         client.messages.create(to=msg_from, from_=msg_to, body=content_body)
 
@@ -155,6 +216,25 @@ def run_normal_query(msg_from: str, msg_to: str, user_query: str):
 def root(worker: BackgroundTasks):
     worker.add_task(write_log, "Bot Started")
     return "Bot Started"
+
+
+def run_image_query(msg_from, msg_to, user_query):
+    image_url = get_generated_image(user_prompt=user_query)
+    client.messages.create(to=msg_from, from_=msg_to, media_url=image_url)
+
+
+def run_user_query(
+    msg_from: str, msg_to: str, user_query: str, worker: BackgroundTasks
+):
+    worker.add_task(write_log, f"Query in Transcript: {user_query}")
+    intent = get_user_intent(user_query).lower()
+    worker.add_task(write_log, message=f"the intent of the user is {intent}")
+    if intent in ["insurance", "pdf"]:
+        run_insurance_query(msg_from, msg_to, user_query)
+    elif intent == "image":
+        run_image_query(msg_from, msg_to, user_query)
+    else:
+        run_normal_query(msg_from, msg_to, user_query)
 
 
 @app.post("/hook")
@@ -170,21 +250,18 @@ async def bot(request: Request, worker: BackgroundTasks):
         if data["MediaContentType0"] == "audio/ogg":
             audio_url = data["MediaUrl0"]
             user_query = await get_transcript(audio_url)
-            worker.add_task(remove_audio_file)
-            worker.add_task(write_log, f"Query in Transcript: {user_query}")
-            intent = str(intent_chain.run({"query": user_query})).lower()
-            if "insurance" in intent:
-                run_insurance_query(msg_from, msg_to, user_query)
-            else:
-                run_normal_query(msg_from, msg_to, user_query)
-            print(user_query)
+            worker.add_task(remove_uploaded_file, "user_query.mp3")
+            run_user_query(msg_from, msg_to, user_query, worker)
         # if the content type is pdf then process the pdf, store it in a vector database and then let the user ask
         # query to the pdf
         elif data["MediaContentType0"] == "application/pdf":
             client.messages.create(
                 to=msg_from,
                 from_=msg_to,
-                body="We are building PDF support, Kindly try with normal query",
+                body=const.processing_pdf,
+            )
+            worker.add_task(
+                ingest_uploaded_pdf, msg_from, msg_to, data["MediaUrl0"], worker
             )
         else:
             client.messages.create(
@@ -198,15 +275,6 @@ async def bot(request: Request, worker: BackgroundTasks):
         )
     else:
         user_query = data["Body"].lower()
-        worker.add_task(write_log, message=f"Query in text message: {user_query}")
-        with get_openai_callback() as cb:
-            intent = str(intent_chain.run({"query": user_query})).lower()
-            print(f"Cost for intent classification is {cb.total_cost}")
-        print(f"the intent of the user is {intent}")
-        worker.add_task(write_log, message=f"the intent of the user is {intent}")
-        if "insurance" in intent:
-            run_insurance_query(msg_from, msg_to, user_query)
-        else:
-            run_normal_query(msg_from, msg_to, user_query)
+        run_user_query(msg_from, msg_to, user_query, worker)
 
     return "Ok"
