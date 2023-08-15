@@ -5,6 +5,7 @@ python-dotenv
 twilio
 openai
 python-multipart
-deeplake
 pypdf
 doctran
+cohere
+qdrant_client
